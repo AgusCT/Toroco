@@ -62,6 +62,8 @@ M.behavior_taskd = {}
 
 M.active_events = {}
 
+M.active_events_inhibited = {}
+
 local events = {
 	new_behavior = {},
     release = {} -- One for each event in torocó
@@ -337,6 +339,64 @@ local get_real_event = function (event_desc)
     end
 end
 
+---- Release a suppression to an event ///
+-- This function releases a suppression to an event for a specific behavior.
+-- The released suppression is the one associated with the running behavior,
+-- and is independent of other inhibitions to the same event that were set by other behaviors.
+-- @param behavior      Releasing behavior.
+-- @param event_desc    Event descriptor (return value of /toroco/device or /toroco/behavior)
+-- @param receiver_desc Receiver descriptor (return value of /toroco/behavior)
+
+local release_suppression = function (behavior, event_desc, receiver_desc)
+
+    local event = get_real_event (event_desc)
+
+    if not event then
+	    log ('TOROCO', 'ERROR', 'release_suppression(): receiver is not valid. %s %s', section, task)
+    end
+
+    for _, receiver in ipairs (registered_receivers[event]) do
+        if receiver.name == receiver_desc.emitter then
+
+            if receiver.suppressed [event] then
+                receiver.suppressed [event] [behavior] = nil;
+            end
+        end
+    end 
+
+    sched.schedule_signal (M.events.release [event], receiver_desc.emitter)
+end
+
+---- Release an inhibition to an event. ///
+-- This function releases an inhibition to an event.
+-- The released inhibition is independent of other inhibitions to the same event that were set by other behaviors.
+-- @param behavior   Releasing behavior.
+-- @param event_desc event descriptor (return value of /toroco/device or /toroco/behavior)
+
+local release_inhibition = function (behavior, event_desc)
+
+    local event = get_real_event (event_desc)
+
+    if not event then
+	    log ('TOROCO', 'ERROR', 'release_inhibition(): receiver is not valid. %s %s', section, task)
+    end
+
+    inhibited_events [event] [behavior] = nil
+
+    sched.schedule_signal (M.events.release [event])
+
+
+    if M.active_events_inhibited [event]  then
+        local beh = M.wait_for_behavior (event_desc.emitter)
+
+        local value = M.active_events_inhibited [event]
+
+        M.active_events_inhibited [event] = nil
+        
+        -- set the event as active with the new values.
+        M.active_events [event] = value
+    end
+end
 
 ---- Inhibit an event. ///
 -- This function inhibits an event sent by a behavior.
@@ -376,25 +436,25 @@ local inhibit = function (behavior, event_desc, timeout)
     else
         inhibited_events [event] [behavior] = { expire_time = nil }
     end
-end
 
----- Release an inhibition to an event. ///
--- This function releases an inhibition to an event.
--- The released inhibition is independent of other inhibitions to the same event that were set by other behaviors.
--- @param behavior   Releasing behavior.
--- @param event_desc event descriptor (return value of /toroco/device or /toroco/behavior)
+    if M.active_events [event] then
+        -- set the event as inactive
+        M.active_events_inhibited [event] = M.active_events [event]
+        M.active_events [event] = nil
+        
+        local beh = M.wait_for_behavior (event_desc.emitter)
 
-local release_inhibition = function (behavior, event_desc)
+        -- release the inhibitions for the event
+        for _, inhibition_target in ipairs (beh.inhibition_targets [event_desc.name] or {}) do
 
-    local event = get_real_event (event_desc)
+            M.release_inhibition (beh, inhibition_target)
+        end
 
-    if not event then
-	    log ('TOROCO', 'ERROR', 'release_inhibition(): receiver is not valid. %s %s', section, task)
+        -- release the suppressions for the event
+        for _, suppression_target in ipairs (beh.suppression_targets [event_desc.name] or {}) do
+            release_suppression (beh, suppression_target.event, suppression_target.receiver)
+        end
     end
-
-    inhibited_events [event] [behavior] = nil
-
-    sched.schedule_signal (M.events.release [event])
 end
 
 ---- Suppresses an event received by a specific behavior. ///
@@ -437,34 +497,6 @@ local suppress = function (behavior, event_desc, receiver_desc, timeout)
             end
         end
     end
-end
-
----- Release a suppression to an event ///
--- This function releases a suppression to an event for a specific behavior.
--- The released suppression is the one associated with the running behavior,
--- and is independent of other inhibitions to the same event that were set by other behaviors.
--- @param behavior      Releasing behavior.
--- @param event_desc    Event descriptor (return value of /toroco/device or /toroco/behavior)
--- @param receiver_desc Receiver descriptor (return value of /toroco/behavior)
-
-local release_suppression = function (behavior, event_desc, receiver_desc)
-
-    local event = get_real_event (event_desc)
-
-    if not event then
-	    log ('TOROCO', 'ERROR', 'release_suppression(): receiver is not valid. %s %s', section, task)
-    end
-
-    for _, receiver in ipairs (registered_receivers[event]) do
-        if receiver.name == receiver_desc.emitter then
-
-            if receiver.suppressed [event] then
-                receiver.suppressed [event] [behavior] = nil;
-            end
-        end
-    end 
-
-    sched.schedule_signal (M.events.release [event], receiver_desc.emitter)
 end
 
 
@@ -705,26 +737,30 @@ M.set_output = function (output_values)
 
         if not event then
             event = get_real_event(M.behavior[beh.name][event_name])
-            print ('Torocó warning: Unused event \'' .. event_name .. '\' at send_output() in behavior ' .. M.behavior_taskd [sched.running_task].name .. '.')
-        end
-        
-        -- set the event as active with the new values.
-        M.active_events [event] = value
-
-        -- start the inhibitions for the event
-        for _, inhibition_target in ipairs (beh.inhibition_targets [event_name] or {}) do
-
-            inhibit (M.behavior_taskd [sched.running_task], inhibition_target)
+            print ('Torocó warning: Unused event \'' .. event_name .. '\' at send_output() in behavior ' .. beh.name .. '.')
         end
 
-        -- start the suppressions for the event
-        for _, suppression_target in ipairs (beh.suppression_targets [event_name] or {}) do
+        if not inhibited_events [event] or inhibited_events [event] and next(inhibited_events [event]) == nil then
+            -- set the event as active with the new values.
+            M.active_events [event] = value
 
-            suppress (M.behavior_taskd [sched.running_task], suppression_target.event, suppression_target.receiver)
+            -- start the inhibitions for the event
+            for _, inhibition_target in ipairs (beh.inhibition_targets [event_name] or {}) do
+
+                inhibit (beh, inhibition_target)
+            end
+
+            -- start the suppressions for the event
+            for _, suppression_target in ipairs (beh.suppression_targets [event_name] or {}) do
+
+                suppress (beh, suppression_target.event, suppression_target.receiver)
+            end
+
+            -- send a signal for the event, with the extra parameters
+            sched.schedule_signal (event, unpack(value))
+        else
+            M.active_events_inhibited [event] = value
         end
-
-	    -- send a signal for the event, with the extra parameters
-        sched.schedule_signal (event, unpack(output_values[event_name]))
     end
 
     sched.wait()
@@ -743,7 +779,7 @@ M.unset_output = function ()
         if M.active_events [event] then
             -- set the event as inactive
             M.active_events [event] = nil
-                
+
             -- release the inhibitions for the event
             for _, inhibition_target in ipairs (beh.inhibition_targets [event_name] or {}) do
 
@@ -754,6 +790,9 @@ M.unset_output = function ()
             for _, suppression_target in ipairs (beh.suppression_targets [event_name] or {}) do
                 release_suppression (M.behavior_taskd [sched.running_task], suppression_target.event, suppression_target.receiver)
             end
+        end
+        if M.active_events_inhibited [event] then
+            M.active_events_inhibited [event] = nil
         end
     end
 end
